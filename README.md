@@ -15,3 +15,7 @@ Runner padrão Ubuntu, timeout e concurrency limitados; action de checkout fixad
 GitHub disponibiliza required reviewers para repositórios públicos e runners hospedados padrão gratuitos para workflows públicos. Isso não comprova disponibilidade ou limites atuais de uma conta específica. Quotas do serviço de origem e destino privado precisam ser verificadas antes de copiar qualquer dado.
 
 Fontes: [Environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments), [execução manual](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow), [cobrança Actions](https://docs.github.com/en/billing/concepts/product-billing/github-actions).
+
+## Trava operacional adicional (06/11/2026)
+
+O job `backup` possui `if: ${{ false }}` no workflow publicado. Esta trava de código impede a execução real mesmo que alguém altere inputs ou variáveis. Para removê-la, será necessária uma alteração revisada do workflow, **além** de Environment com required reviewers, bypass administrativo proibido, custódia, quotas, segredos vinculados de modo seguro e autorização separada. A desativação administrativa do workflow (`disabled_manually`) ainda **não foi comprovada**: a integração GitHub atual não disponibiliza as operações de administração de Actions/Environments. Não executar o workflow.
