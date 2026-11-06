@@ -1,0 +1,147 @@
+name: AlfaFit private backup (manual, disabled by default)
+
+on:
+  workflow_dispatch:
+    inputs:
+      execute_backup:
+        description: 'Exportar dados reais? Exige autorização posterior, quota, custódia e revisão do Environment.'
+        type: boolean
+        required: true
+        default: false
+      reviewed_sha:
+        description: 'SHA completo aprovado da origem privada (sem credenciais).'
+        type: string
+        required: true
+      confirm_project:
+        description: 'Confirmar o identificador do ambiente autorizado.'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: alfafit-homologacao-backup
+  cancel-in-progress: false
+
+jobs:
+  policy:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository_owner == 'lodipersonal' && github.actor == 'lodipersonal' &&
+      github.triggering_actor == 'lodipersonal' &&
+      github.repository == 'lodipersonal/alfafit-homologacao-ops' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate dispatch without database credentials
+        env:
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+          CONFIRM_PROJECT: ${{ inputs.confirm_project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test -n "$CONFIRM_PROJECT"
+          printf '%s\n' 'Preflight only. No database connection, copy, upload or artifact.'
+      - name: Read actual environment approval policy
+        if: inputs.execute_backup && vars.ALFAFIT_BACKUP_ENABLED == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.request
+          repo=os.environ['GITHUB_REPOSITORY']
+          request=urllib.request.Request('https://api.github.com/repos/'+repo+'/environments/alfafit-homologacao-backup',headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+          try:
+              with urllib.request.urlopen(request,timeout=20) as response: policy=json.load(response)
+              assert policy.get('can_admins_bypass') is False
+              assert any(rule.get('type')=='required_reviewers' and rule.get('reviewers') for rule in policy.get('protection_rules',[]))
+          except Exception:
+              raise SystemExit('STOP: Environment com required reviewers indisponível/não configurado; sem fallback automático.')
+          print('Environment review policy exists. Protected job still requires actual approval.')
+          PY
+
+  backup:
+    needs: policy
+    if: needs.policy.result == 'success' && inputs.execute_backup && vars.ALFAFIT_BACKUP_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: alfafit-homologacao-backup
+    steps:
+      - name: Verify source branch before executing any repository code
+        env:
+          SOURCE_READ_TOKEN: ${{ secrets.ALFAFIT_SOURCE_READ_TOKEN }}
+          SOURCE_REPOSITORY: ${{ vars.ALFAFIT_SOURCE_REPOSITORY }}
+          SOURCE_BRANCH: ${{ vars.ALFAFIT_SOURCE_BRANCH }}
+          APPROVED_SHA: ${{ vars.ALFAFIT_APPROVED_SOURCE_SHA }}
+          EXPECTED_PROJECT: ${{ vars.ALFAFIT_PROJECT_REF }}
+          CONFIRM_PROJECT: ${{ inputs.confirm_project }}
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import json, os, re, urllib.parse, urllib.request
+          source=os.environ['SOURCE_REPOSITORY']; branch=os.environ['SOURCE_BRANCH']
+          if not os.environ['EXPECTED_PROJECT'] or os.environ['EXPECTED_PROJECT'] != os.environ['CONFIRM_PROJECT']:
+              raise SystemExit('STOP: project not approved.')
+          if not re.fullmatch(r'lodipersonal/[A-Za-z0-9_.-]+',source) or not branch or not os.environ['SOURCE_READ_TOKEN']:
+              raise SystemExit('STOP: restricted source and read-only token required.')
+          if os.environ['REVIEWED_SHA'] != os.environ['APPROVED_SHA']:
+              raise SystemExit('STOP: SHA not approved.')
+          url='https://api.github.com/repos/'+source+'/git/ref/heads/'+urllib.parse.quote(branch,safe='')
+          request=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['SOURCE_READ_TOKEN'],'Accept':'application/vnd.github+json'})
+          try:
+              with urllib.request.urlopen(request,timeout=20) as response: ref=json.load(response)
+              assert ref['object']['sha']==os.environ['REVIEWED_SHA']
+          except Exception:
+              raise SystemExit('STOP: reviewed SHA is not the owned source branch HEAD.')
+          PYCODE
+      - name: Checkout reviewed private source only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ vars.ALFAFIT_SOURCE_REPOSITORY }}
+          ref: ${{ inputs.reviewed_sha }}
+          token: ${{ secrets.ALFAFIT_SOURCE_READ_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify origin, actual approval, quotas and disabled custody gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_READ_TOKEN: ${{ secrets.ALFAFIT_SOURCE_READ_TOKEN }}
+          SOURCE_REPOSITORY: ${{ vars.ALFAFIT_SOURCE_REPOSITORY }}
+          SOURCE_BRANCH: ${{ vars.ALFAFIT_SOURCE_BRANCH }}
+          APPROVED_SHA: ${{ vars.ALFAFIT_APPROVED_SOURCE_SHA }}
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+          CONFIRM_PROJECT: ${{ inputs.confirm_project }}
+          ALFAFIT_BACKUP_DESTINATION_READY: ${{ vars.ALFAFIT_BACKUP_DESTINATION_READY }}
+          ALFAFIT_EGRESS_QUOTA_JSON: ${{ vars.ALFAFIT_EGRESS_QUOTA_JSON }}
+          ALFAFIT_ACTIONS_BUDGET_JSON: ${{ vars.ALFAFIT_ACTIONS_BUDGET_JSON }}
+        run: python3 scripts/mission83-actions-backup.py policy
+      - name: Prepare public PG17 and Vault dependencies (no database secrets)
+        run: bash scripts/mission83-prepare-runtime.sh
+      - name: Create encrypted ephemeral staging
+        run: python3 scripts/mission83-actions-backup.py staging
+      - name: Export, copy, restore, encrypt and store private backup
+        env:
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+          CONFIRM_PROJECT: ${{ inputs.confirm_project }}
+          ALFAFIT_BACKUP_DESTINATION_READY: ${{ vars.ALFAFIT_BACKUP_DESTINATION_READY }}
+          ALFAFIT_EGRESS_QUOTA_JSON: ${{ vars.ALFAFIT_EGRESS_QUOTA_JSON }}
+          ALFAFIT_PG_HOST: ${{ vars.ALFAFIT_PG_HOST }}
+          ALFAFIT_DRIVE_FOLDER_ID: ${{ vars.ALFAFIT_DRIVE_FOLDER_ID }}
+          ALFAFIT_RECOVERY_KEY_FINGERPRINT: ${{ vars.ALFAFIT_RECOVERY_KEY_FINGERPRINT }}
+          ALFAFIT_RECOVERY_KEY_CUSTODIAN_CONFIRMED: ${{ vars.ALFAFIT_RECOVERY_KEY_CUSTODIAN_CONFIRMED }}
+          ALFAFIT_DB_PASSWORD: ${{ secrets.ALFAFIT_DB_PASSWORD }}
+          ALFAFIT_STORAGE_READ_KEY: ${{ secrets.ALFAFIT_STORAGE_READ_KEY }}
+          ALFAFIT_BACKUP_DRIVE_TOKEN: ${{ secrets.ALFAFIT_BACKUP_DRIVE_TOKEN }}
+          ALFAFIT_BACKUP_PUBLIC_KEY: ${{ secrets.ALFAFIT_BACKUP_PUBLIC_KEY }}
+        run: python3 scripts/mission83-actions-backup.py backup
+      - name: Always destroy plaintext, encrypted staging key and local restore runtime
+        if: always()
+        run: python3 scripts/mission83-actions-backup.py cleanup
