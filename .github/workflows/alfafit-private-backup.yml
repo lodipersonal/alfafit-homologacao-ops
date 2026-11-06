@@ -71,7 +71,10 @@ jobs:
     # HARD LOCK: deliberately impossible until required reviewers, no-bypass policy,
     # quota and private custody are verified and a separate execution is authorized.
     # A future reviewed commit must explicitly remove this lock.
-    if: ${{ false }}
+    if: >-
+      needs.policy.result == 'success' &&
+      inputs.execute_backup &&
+      vars.ALFAFIT_BACKUP_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment: alfafit-homologacao-backup
